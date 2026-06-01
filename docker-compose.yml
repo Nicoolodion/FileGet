@@ -1,0 +1,21 @@
+services:
+  plex-get:
+    build: .
+    image: plex-get:latest
+    container_name: plex-get
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
+    volumes:
+      - ./data:/app/data
+      - ${MEDIA_PATH_MOVIES:-/mnt/media/Movies}:/media/Movies
+      - ${MEDIA_PATH_SERIES:-/mnt/media/Series}:/media/Series
+      - ${MEDIA_PATH_ANIME_MOVIES:-/mnt/media/Anime-Movies}:/media/Anime-Movies
+      - ${MEDIA_PATH_ANIME_SERIES:-/mnt/media/Anime-Series}:/media/Anime-Series
+      - ${MEDIA_PATH_UNCATEGORIZED:-/mnt/media/Uncategorized}:/media/Uncategorized
+      - ${TEMP_PATH:-/mnt/cache/plex-get-temp}:/temp
+    ports:
+      - "${WEB_PORT:-8000}:8000"

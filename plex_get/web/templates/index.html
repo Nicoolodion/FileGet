@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Plex-Get</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<header>
+  <h1>Plex-Get</h1>
+  <nav>
+    <button class="tab" data-tab="tasks">Tasks</button>
+    <button class="tab" data-tab="new">New Task</button>
+    <button class="tab" data-tab="passwords">Passwords</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </nav>
+  <span id="ws-status" class="badge offline">disconnected</span>
+</header>
+
+<main>
+  <section id="view-tasks" class="view active">
+    <div class="filters">
+      <label><input type="checkbox" id="show-finished" /> Show finished in the last 24h</label>
+      <button id="refresh-tasks">Refresh</button>
+    </div>
+    <div id="tasks-list"></div>
+  </section>
+
+  <section id="view-new" class="view">
+    <h2>New Task</h2>
+    <div class="form-row">
+      <label>Type
+        <select id="new-type">
+          <option value="movie">Movie</option>
+          <option value="series">Series</option>
+          <option value="anime_movie">Anime-Movie</option>
+          <option value="anime_series">Anime-Series</option>
+          <option value="uncategorized">Uncategorized</option>
+        </select>
+      </label>
+      <label>Title (optional)
+        <input id="new-title" type="text" placeholder="auto from filename if empty" />
+      </label>
+    </div>
+    <label>Links (one per line, or comma separated). You can also upload a .dlc file below.
+      <textarea id="new-links" rows="8" placeholder="https://example.com/file/abc"></textarea>
+    </label>
+    <div class="form-row">
+      <label>.dlc file <input id="new-dlc" type="file" accept=".dlc,text/plain" /></label>
+      <button id="new-create">Create &amp; Debrid</button>
+    </div>
+
+    <div id="new-preview" class="hidden">
+      <h3>Debrid preview</h3>
+      <ul id="new-preview-list"></ul>
+      <div class="form-row">
+        <button id="new-confirm">Start download (Enter)</button>
+        <button id="new-cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-passwords" class="view">
+    <h2>Archive passwords (tried in order)</h2>
+    <ul id="pw-list"></ul>
+    <div class="form-row">
+      <input id="pw-value" type="text" placeholder="new password" />
+      <button id="pw-add">Add</button>
+    </div>
+  </section>
+
+  <section id="view-settings" class="view">
+    <h2>Settings</h2>
+    <div class="form-row">
+      <label>Concurrent downloads <input id="set-concurrency" type="number" min="1" max="16" /></label>
+      <button id="set-concurrency-save">Save</button>
+    </div>
+    <h3>Paths</h3>
+    <ul id="paths-list"></ul>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
