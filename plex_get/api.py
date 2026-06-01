@@ -28,6 +28,8 @@ TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.on_event("startup")
 async def _startup() -> None:
+    import asyncio as _asyncio
+    bus.bind_loop(_asyncio.get_running_loop())
     init_db()
     await get_manager().start()
 
@@ -288,6 +290,27 @@ async def set_concurrency(request: Request, value: int):
     _require_auth(request)
     get_manager().set_concurrency(value)
     return {"ok": True, "value": value}
+
+
+@app.post("/api/manager/pause")
+async def pause_manager(request: Request):
+    _require_auth(request)
+    get_manager().pause()
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/manager/resume")
+async def resume_manager(request: Request):
+    _require_auth(request)
+    get_manager().resume()
+    return {"ok": True, "paused": False}
+
+
+@app.get("/api/manager/status")
+async def manager_status(request: Request):
+    _require_auth(request)
+    m = get_manager()
+    return {"paused": m.is_paused()}
 
 
 @app.websocket("/ws")

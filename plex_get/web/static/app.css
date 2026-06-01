@@ -16,13 +16,14 @@ main { padding: 1rem; }
 .task h3 { margin: 0 0 .4rem; display:flex; justify-content: space-between; align-items: center; gap:.5rem; }
 .task .meta { color: var(--muted); font-size: .85rem; }
 .task .links { margin-top: .5rem; }
-.task .link { display: grid; grid-template-columns: 1fr 100px 80px; gap: .5rem; align-items: center; padding: .2rem 0; border-top: 1px dashed #333; font-size: .85rem; }
+.task .link { display: grid; grid-template-columns: 1fr 100px 80px 90px; gap: .5rem; align-items: center; padding: .2rem 0; border-top: 1px dashed #333; font-size: .85rem; }
 .task .link:first-child { border-top: none; }
 .task .link .url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .task .link .url.ok { color: var(--ok); }
 .task .link .url.err { color: var(--err); }
 .progress { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+.speed { color: var(--muted); font-variant-numeric: tabular-nums; font-size: .8rem; text-align: right; }
 .status { font-size: .8rem; padding: .15rem .4rem; border-radius: 3px; background: #333; }
 .status.queued { background: #555; }
 .status.processing { background: var(--warn); color:#000; }
