@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import time
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ class Manager:
         self._paused = asyncio.Event()
         self._paused.set()
         self._worker_task: Optional[asyncio.Task] = None
+        self._cleaner_task: Optional[asyncio.Task] = None
         self._link_futures: dict[int, asyncio.Future] = {}
         self._futures_lock = asyncio.Lock()
         self._cancelled_links: set[int] = set()
@@ -58,16 +60,19 @@ class Manager:
             self._stop.clear()
             self._paused.set()
             self._worker_task = asyncio.create_task(self._dispatch_loop())
+        if self._cleaner_task is None or self._cleaner_task.done():
+            self._cleaner_task = asyncio.create_task(self._background_cleaner())
 
     async def stop(self) -> None:
         self._stop.set()
         self._paused.set()
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        for t in (self._worker_task, self._cleaner_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     def set_concurrency(self, n: int) -> None:
         self._max_concurrent = max(1, n)
@@ -138,6 +143,39 @@ class Manager:
         if link.expected_size and candidate.stat().st_size != link.expected_size:
             return None
         return candidate
+
+    def is_actually_multipart(self, part_file: Path) -> bool:
+        """Open a `.part1.rar` (or any .rar) with rarfile and return True if
+        the archive is part of a real multi-volume set (i.e. it advertises
+        sibling volumes). Returns False for standalone archives that happen
+        to be named `.part1.rar`. Catches any parser errors and returns True
+        (safer to over-wait than under-wait)."""
+        try:
+            import rarfile
+            with rarfile.RarFile(str(part_file)) as rf:
+                # Some backends (unrar/unar) don't populate .volumes reliably.
+                # Fall back to header inspection: a multi-volume RAR has a
+                # volume number field in its main header.
+                try:
+                    vols = getattr(rf, 'volumes', None) or []
+                    if vols:
+                        return True
+                except Exception:
+                    pass
+                # Inspect main header for volume flags
+                try:
+                    header = rf.mainheader
+                    flags = getattr(header, 'flags', 0) or 0
+                    # RAR4: 0x0100 = volume (file is part of a multi-volume set)
+                    # RAR5: 0x0010 = split-before (volume)
+                    if (flags & 0x0100) or (flags & 0x0010):
+                        return True
+                except Exception:
+                    pass
+            return False
+        except Exception:
+            # If we can't tell, assume multipart to avoid extracting a partial set.
+            return True
 
     async def reprocess_task(self, task_id: int) -> dict:
         """Scan a task's temp dir for complete multi-volume RAR sets and trigger
@@ -362,6 +400,15 @@ class Manager:
                                 progress = (received / total) if total else 0.0
                                 await self._update_link_progress(link_id, progress, speed)
                                 last_update = now
+                        # fsync so the extractor never opens a half-flushed file
+                        try:
+                            f.flush()
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                    # Brief settle so the OS releases the handle and any
+                    # other tool (unar, rarfile) sees the full file.
+                    await asyncio.sleep(0.1)
                     await self._update_link_progress(link_id, 1.0, 0.0)
         with SessionLocal() as db:
             link = db.get(DownloadLink, link_id)
@@ -419,6 +466,24 @@ class Manager:
                 raise
             await self._set_link_status(link_id, LinkStatus.DONE)
             await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+            await self._finalize_task(task_id)
+            return
+
+        # If no other link in this task shares the same volume-set base, the
+        # file might still be a standalone archive that just happens to be
+        # named `.part1.rar`. Ask rarfile to confirm; if it's standalone we
+        # extract it now instead of waiting for a part2 that will never come.
+        if len(members) == 1 and not self.is_actually_multipart(downloaded):
+            await self._append_task_log(task_id, f'{downloaded.name} is a standalone archive (no siblings in task)')
+            await self._set_link_status(link_id, LinkStatus.EXTRACTING)
+            try:
+                await self._extract_or_move_one(task_id, media_type, downloaded, passwords)
+            except Exception as e:
+                await self._append_task_log(task_id, f'Link {link_id} extraction failed: {e}')
+                raise
+            await self._set_link_status(link_id, LinkStatus.DONE)
+            await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+            await self._finalize_task(task_id)
             return
 
         # Multi-volume set. The set's "download phase" is complete when every
@@ -487,14 +552,16 @@ class Manager:
     async def _fail_set_members(self, task_id: int, base: str, link_ids: list[int], reason: str) -> None:
         """Mark a set's remaining members as FAILED and delete their partial files on disk."""
         for lid in link_ids:
+            error_msg = ''
             with SessionLocal() as db:
                 link = db.get(DownloadLink, lid)
                 if not link or link.status == LinkStatus.FAILED:
                     continue
                 link.status = LinkStatus.FAILED
                 link.error = f'set {base}: {reason}'
+                error_msg = link.error
                 db.commit()
-            await bus.publish('links', {'id': lid, 'status': 'failed', 'error': link.error})
+            await bus.publish('links', {'id': lid, 'status': 'failed', 'error': error_msg})
         # Try to clean up on-disk parts (best-effort).
         try:
             settings = get_settings()
@@ -581,7 +648,6 @@ class Manager:
         if not links:
             await self._set_task_status(task_id, TaskStatus.COMPLETED)
             await notify_task(task_id, 'completed', 'Empty task')
-            await self._cleanup_task_dir(task_id)
             return
         all_terminal = all(l.status in (LinkStatus.DONE, LinkStatus.FAILED) for l in links)
         if not all_terminal:
@@ -596,12 +662,49 @@ class Manager:
             await notify_task(task_id, 'completed', f'All {len(links)} links done')
         else:
             await self._set_task_status(task_id, TaskStatus.COMPLETED)
-        await self._cleanup_task_dir(task_id)
+        # DO NOT clean up the task dir here - a late-arriving download or a
+        # reprocess call may still need the parts. The background cleaner
+        # removes old task dirs after a grace period.
 
     async def _cleanup_task_dir(self, task_id: int) -> None:
         settings = get_settings()
         task_dir = Path(settings.temp_path) / f'task_{task_id}'
         safe_rmtree(task_dir)
+
+    async def cleanup_old_task_dirs(self, max_age_seconds: int = 3600) -> int:
+        """Remove task_* directories whose mtime is older than max_age_seconds.
+        Returns the number of directories removed."""
+        import time as _time
+        settings = get_settings()
+        temp_root = Path(settings.temp_path)
+        if not temp_root.exists():
+            return 0
+        now = _time.time()
+        removed = 0
+        for entry in temp_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if not entry.name.startswith('task_'):
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime >= max_age_seconds:
+                safe_rmtree(entry)
+                removed += 1
+        return removed
+
+    async def _background_cleaner(self) -> None:
+        """Periodically remove old task dirs from the temp volume."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(600)  # every 10 minutes
+                await self.cleanup_old_task_dirs()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # pragma: no cover
+                log.debug('background cleaner error: %s', e)
 
     async def _set_link_status(self, link_id: int, status: LinkStatus, error: str = '') -> None:
         with SessionLocal() as db:
