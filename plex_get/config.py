@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     web_port: int = Field(8000, alias="WEB_PORT")
 
+    dcrypt_base_url: str = Field("https://dcrypt.it", alias="DCRYPT_BASE_URL")
+
     def media_path_for(self, media_type: str) -> Path:
         mapping = {
             "movie": self.media_path_movies,
