@@ -257,6 +257,15 @@ class Manager:
                             f'Not enough free space on temp volume: need {total} bytes, have {free} bytes '
                             f'(temp={temp_root})'
                         )
+                # Record the expected filename + size on the link BEFORE writing
+                # any bytes. This lets the manager identify multi-volume sets
+                # even when sibling downloads are still in flight.
+                with SessionLocal() as db:
+                    link = db.get(DownloadLink, link_id)
+                    if link is not None:
+                        link.expected_filename = filename
+                        link.expected_size = total
+                        db.commit()
                 received = 0
                 start = time.time()
                 last_update = 0.0
@@ -279,54 +288,130 @@ class Manager:
         await self._append_task_log(task_id, f'Download finished: {target.name}')
         return target
 
+    def _set_membership(self, links: list, link_id: int) -> tuple[str | None, int, list]:
+        """Return (base_name, part_index, set_members) for the link's RAR set.
+
+        Set membership is determined from `expected_filename` (or, as a
+        fallback, `filename`), so links that are still downloading are correctly
+        identified as part of the set even before they write any bytes.
+        Returns (None, 0, []) for non-RAR files or single-volume archives.
+        """
+        link = next((l for l in links if l.id == link_id), None)
+        if not link:
+            return None, 0, []
+        name = link.expected_filename or link.filename
+        if not name or not name.lower().endswith('.rar'):
+            return None, 0, []
+        base, idx = volume_group_key(name)
+        if idx == 0:
+            return None, 0, []
+        members = []
+        for l in links:
+            other_name = l.expected_filename or l.filename
+            if not other_name or not other_name.lower().endswith('.rar'):
+                continue
+            other_base, _ = volume_group_key(other_name)
+            if other_base == base:
+                members.append(l)
+        return base, idx, members
+
     async def _try_extract_after_link(self, task_id: int, link_id: int, downloaded: Path) -> None:
         """Inspect the link's file; if it is part of a multi-volume set, try to extract
         that set as soon as all its siblings have also finished downloading."""
         with SessionLocal() as db:
-            link = db.get(DownloadLink, link_id)
-            if not link:
-                return
             task = db.get(Task, task_id)
+            if not task:
+                return
             links = list(task.links)
             passwords = [p.value for p in db.query(Password).order_by(Password.position.asc(), Password.id.asc()).all()]
             media_type: MediaType = task.media_type
 
-        filename = downloaded.name
-        suffix = downloaded.suffix.lower()
-        if suffix == '.rar':
-            base, idx = volume_group_key(filename)
-            if idx > 0:
-                # Multi-volume set: wait for every other link in this task that
-                # also belongs to the same set to reach a terminal state.
-                siblings = [l for l in links if l.id != link_id and l.filename and volume_group_key(l.filename)[0] == base]
-                in_flight = [l for l in siblings if l.status not in (LinkStatus.DONE, LinkStatus.FAILED)]
-                failed = [l for l in siblings if l.status == LinkStatus.FAILED]
-                if in_flight:
-                    return
-                if failed:
-                    # Don't try to extract a broken set; the task finalize step
-                    # will mark it FAILED.
-                    return
-                # All siblings done. Group the files we have on disk and extract.
-                await self._set_link_status(link_id, LinkStatus.EXTRACTING)
-                try:
-                    await self._extract_volume_set(task_id, media_type, base, passwords)
-                except Exception as e:
-                    await self._append_task_log(task_id, f'Set {base} extraction failed: {e}')
-                    raise
-                await self._set_link_status(link_id, LinkStatus.DONE)
-                await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
-                return
+        base, _, members = self._set_membership(links, link_id)
+        if base is None:
+            # Standalone RAR or non-archive: extract/move immediately.
+            await self._set_link_status(link_id, LinkStatus.EXTRACTING)
+            try:
+                await self._extract_or_move_one(task_id, media_type, downloaded, passwords)
+            except Exception as e:
+                await self._append_task_log(task_id, f'Link {link_id} extraction failed: {e}')
+                raise
+            await self._set_link_status(link_id, LinkStatus.DONE)
+            await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+            return
 
-        # Single-volume RAR or non-archive file: extract/move immediately.
+        # Multi-volume set: collect member states.
+        not_terminal = [l for l in members if l.status not in (LinkStatus.DONE, LinkStatus.FAILED)]
+        failed_members = [l for l in members if l.status == LinkStatus.FAILED]
+        if not_terminal:
+            # Wait for the rest to finish. Mark our own status as DOWNLOADING
+            # still so the UI shows progress correctly.
+            return
+        if failed_members:
+            # The set is broken. Mark all members FAILED (other than the
+            # already-failed ones) and clean up any partial files on disk.
+            ids_to_fail = [l.id for l in members if l.status != LinkStatus.FAILED]
+            await self._fail_set_members(task_id, base, ids_to_fail, 'set has failed members')
+            return
+
+        # All members downloaded successfully. Verify every expected part is
+        # on disk with the right size before letting rarfile touch anything.
+        settings = get_settings()
+        task_dir = Path(settings.temp_path) / f'task_{task_id}'
+        missing = []
+        for m in members:
+            part_name = m.expected_filename or m.filename
+            part_idx = volume_group_key(part_name)[1] if part_name else 0
+            # Locate the actual file on disk for this part.
+            candidates = [p for p in task_dir.iterdir() if p.is_file() and volume_group_key(p.name) == (volume_group_key(part_name)[0], part_idx)]
+            if not candidates:
+                missing.append(f'{part_name} (not on disk)')
+                continue
+            actual = candidates[0]
+            if m.expected_size and actual.stat().st_size != m.expected_size:
+                missing.append(f'{actual.name} (size {actual.stat().st_size} != expected {m.expected_size})')
+        if missing:
+            await self._fail_set_members(task_id, base, [l.id for l in members], 'incomplete parts on disk: ' + ', '.join(missing))
+            return
+
+        # Mark this link EXTRACTING (the one that triggered extraction) and run.
         await self._set_link_status(link_id, LinkStatus.EXTRACTING)
         try:
-            await self._extract_or_move_one(task_id, media_type, downloaded, passwords)
+            await self._extract_volume_set(task_id, media_type, base, passwords)
         except Exception as e:
-            await self._append_task_log(task_id, f'Link {link_id} extraction failed: {e}')
+            await self._append_task_log(task_id, f'Set {base} extraction failed: {e}')
+            await self._fail_set_members(task_id, base, [l.id for l in members if l.id != link_id and l.status != LinkStatus.FAILED], str(e))
             raise
-        await self._set_link_status(link_id, LinkStatus.DONE)
+        # Mark all members DONE (this one already via _set_link_status above).
+        for m in members:
+            if m.id != link_id:
+                await self._set_link_status(m.id, LinkStatus.DONE)
+                await bus.publish('links', {'id': m.id, 'task_id': task_id, 'status': 'done'})
         await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+
+    async def _fail_set_members(self, task_id: int, base: str, link_ids: list[int], reason: str) -> None:
+        """Mark a set's remaining members as FAILED and delete their partial files on disk."""
+        for lid in link_ids:
+            with SessionLocal() as db:
+                link = db.get(DownloadLink, lid)
+                if not link or link.status == LinkStatus.FAILED:
+                    continue
+                link.status = LinkStatus.FAILED
+                link.error = f'set {base}: {reason}'
+                db.commit()
+            await bus.publish('links', {'id': lid, 'status': 'failed', 'error': link.error})
+        # Try to clean up on-disk parts (best-effort).
+        try:
+            settings = get_settings()
+            task_dir = Path(settings.temp_path) / f'task_{task_id}'
+            for p in list(task_dir.iterdir()):
+                if p.is_file() and volume_group_key(p.name)[0] == base:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        await self._append_task_log(task_id, f'Set {base} failed: {reason}')
 
     async def _extract_volume_set(self, task_id: int, media_type: MediaType, base: str, passwords: list[str]) -> None:
         settings = get_settings()

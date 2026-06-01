@@ -74,6 +74,8 @@ class DownloadLink(Base):
     original_url: Mapped[str] = mapped_column(Text)
     debrided_url: Mapped[str] = mapped_column(Text, default="")
     filename: Mapped[str] = mapped_column(String(500), default="")
+    expected_filename: Mapped[str] = mapped_column(String(500), default="")
+    expected_size: Mapped[int] = mapped_column(Integer, default=0)
     final_path: Mapped[str] = mapped_column(String(1000), default="")
     status: Mapped[LinkStatus] = mapped_column(SAEnum(LinkStatus), default=LinkStatus.PENDING)
     progress: Mapped[float] = mapped_column(default=0.0)

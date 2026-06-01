@@ -57,6 +57,8 @@ def _link_to_out(l: DownloadLink) -> LinkOut:
         original_url=l.original_url,
         debrided_url=l.debrided_url,
         filename=l.filename,
+        expected_filename=l.expected_filename,
+        expected_size=l.expected_size,
         final_path=l.final_path,
         status=l.status,
         progress=l.progress,

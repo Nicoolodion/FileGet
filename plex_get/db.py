@@ -37,3 +37,11 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    # Lightweight migrations: add new columns to existing tables without Alembic.
+    with engine.begin() as conn:
+        from sqlalchemy import text
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(download_links)")).fetchall()}
+        if 'expected_filename' not in cols:
+            conn.execute(text("ALTER TABLE download_links ADD COLUMN expected_filename VARCHAR(500) DEFAULT ''"))
+        if 'expected_size' not in cols:
+            conn.execute(text("ALTER TABLE download_links ADD COLUMN expected_size INTEGER DEFAULT 0"))

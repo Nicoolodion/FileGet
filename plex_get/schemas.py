@@ -36,6 +36,8 @@ class LinkOut(BaseModel):
     original_url: str
     debrided_url: str
     filename: str
+    expected_filename: str
+    expected_size: int
     final_path: str
     status: LinkStatus
     progress: float

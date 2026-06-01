@@ -49,9 +49,9 @@ def test_free_bytes_known_path() -> None:
 
 @pytest.fixture
 def temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Point the app at a throwaway sqlite file and init the schema."""
-    import importlib
+    """Deprecated: use conftest.temp_db instead. Kept for backwards compat."""
     from plex_get import db as dbmod
+    from plex_get import manager as mgrmod
     db_file = tmp_path / 'plex-get.db'
     monkeypatch.setenv('DATABASE_PATH', str(db_file))
     dbmod.get_settings.cache_clear()
@@ -59,8 +59,6 @@ def temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     new_session = dbmod.sessionmaker(bind=new_engine, autoflush=False, autocommit=False, future=True)
     monkeypatch.setattr(dbmod, 'engine', new_engine)
     monkeypatch.setattr(dbmod, 'SessionLocal', new_session)
-    # Rebind the manager's module-level `SessionLocal` symbol too
-    from plex_get import manager as mgrmod
     monkeypatch.setattr(mgrmod, 'SessionLocal', new_session)
     from plex_get.db import init_db
     init_db()

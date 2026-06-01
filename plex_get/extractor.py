@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import rarfile
+
+log = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.webm'}
 
@@ -83,6 +86,11 @@ def _largest_video_in_rar(rf: rarfile.RarFile) -> Optional[rarfile.RarInfo]:
     return max(candidates, key=lambda i: i.file_size)
 
 
+class ArchiveCorrupt(Exception):
+    """Raised when a RAR is structurally invalid (truncated, bad CRC, etc.) and is
+    not the result of an incorrect password."""
+
+
 def extract_archive(
     archive: Path,
     destination: Path,
@@ -93,6 +101,10 @@ def extract_archive(
     """Extract a (multi-volume) RAR archive. When *first_volume* is supplied (i.e. the
     `.part1.rar` of a set), rarfile uses it as the entry-point and automatically follows
     the subsequent `.partN.rar` siblings on disk.
+
+    Passwords are tried only for `PasswordRequired`-style errors. A `BadRarFile`
+    (truncated file, bad CRC, missing volume) is treated as corruption and raised
+    immediately as `ArchiveCorrupt` - trying more passwords won't help.
     """
     destination.mkdir(parents=True, exist_ok=True)
     entry = first_volume or archive
@@ -104,10 +116,17 @@ def extract_archive(
                     rf.setpassword(pw)
                 rf.extractall(str(destination))
             return _largest_video_in_dir(destination) or _resolve_extracted_video(destination)
-        except (rarfile.BadRarFile, rarfile.PasswordRequired, Exception) as e:
+        except rarfile.PasswordRequired as e:
             last_error = e
-            log.debug('Rar extract attempt failed (pw=%r): %s', pw, e)
+            log.debug('Rar extract needs password (pw=%r): %s', pw, e)
             continue
+        except (rarfile.BadRarFile, Exception) as e:
+            # BadRarFile here means a real problem with the archive content
+            # (truncated read, bad CRC, missing volume, ...). Trying more
+            # passwords is pointless; surface as ArchiveCorrupt so the caller
+            # can re-download / fail cleanly.
+            log.debug('Rar extract failed (pw=%r): %s', pw, e)
+            raise ArchiveCorrupt(str(e)) from e
     if last_error:
         raise last_error
     raise RuntimeError('Extraction failed for unknown reason')
