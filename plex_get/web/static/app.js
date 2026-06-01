@@ -141,7 +141,7 @@
       </div>`;
     }).join('');
     return `<div class="task" data-id="${t.id}">
-      <h3>#${t.id} <span>${escapeHtml(t.title || '')}</span> ${statusBadge(t.status)} <button class="secondary small del">Delete</button></h3>
+      <h3>#${t.id} <span>${escapeHtml(t.title || '')}</span> ${statusBadge(t.status)} <button class="secondary small reprocess">Reprocess</button> <button class="secondary small del">Delete</button></h3>
       <div class="meta">${t.media_type} · created ${new Date(t.created_at).toLocaleString()} ${t.finished_at ? '· finished ' + new Date(t.finished_at).toLocaleString() : ''}</div>
       <div class="links">${linksHtml || '<div class="muted">no links</div>'}</div>
       ${t.log ? `<div class="log" data-task-id="${t.id}">${escapeHtml(t.log)}</div>` : ''}
@@ -183,6 +183,13 @@
       const id = e.target.closest('.task').dataset.id;
       await api(`/api/tasks/${id}`, { method: 'DELETE' });
       refreshTasks();
+    } else if (e.target.classList.contains('reprocess')) {
+      const id = e.target.closest('.task').dataset.id;
+      try {
+        const r = await api(`/api/tasks/${id}/reprocess`, { method: 'POST' });
+        if (!r.ok) alert('Reprocess: ' + (r.reason || 'no result'));
+      } catch (err) { alert('Reprocess failed: ' + err.message); }
+      debouncedFullRefresh();
     } else if (e.target.classList.contains('link-cancel')) {
       const id = e.target.dataset.id;
       await api(`/api/links/${id}/cancel`, { method: 'POST' });

@@ -244,6 +244,18 @@ async def retry_link(link_id: int, request: Request, db: Session = Depends(get_d
     return {"ok": True}
 
 
+@app.post("/api/tasks/{task_id}/reprocess")
+async def reprocess_task(task_id: int, request: Request, db: Session = Depends(get_db)):
+    """Re-scan a task's temp dir and run extraction for any complete multi-volume
+    set on disk. Use this to recover a task whose per-link extraction trigger
+    never fired (e.g. after upgrading the app to a fixed version)."""
+    _require_auth(request)
+    t = db.get(Task, task_id)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return await get_manager().reprocess_task(task_id)
+
+
 @app.get("/api/passwords")
 async def list_passwords(request: Request, db: Session = Depends(get_db)):
     _require_auth(request)

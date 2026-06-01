@@ -115,11 +115,88 @@ class Manager:
         await bus.publish('links', {'id': link_id, 'status': 'pending', 'error': '', 'progress': 0, 'speed': 0})
         return task_id
 
+    def part_path(self, task_id: int, link: DownloadLink) -> Optional[Path]:
+        """Return the on-disk path for a link's downloaded part, if it exists
+        with the expected size. Used for resume / re-process flows."""
+        settings = get_settings()
+        task_dir = Path(settings.temp_path) / f'task_{task_id}'
+        name = link.expected_filename or link.filename
+        if not name:
+            return None
+        candidate = task_dir / name
+        if not candidate.exists():
+            # Try to find by part index in case filename capitalization differs.
+            base, idx = volume_group_key(name)
+            if idx == 0 and name.lower().endswith('.rar'):
+                base = name
+            for p in task_dir.iterdir():
+                if p.is_file() and volume_group_key(p.name) == (base, idx):
+                    candidate = p
+                    break
+            else:
+                return None
+        if link.expected_size and candidate.stat().st_size != link.expected_size:
+            return None
+        return candidate
+
+    async def reprocess_task(self, task_id: int) -> dict:
+        """Scan a task's temp dir for complete multi-volume RAR sets and trigger
+        extraction on the first complete set found. Used to recover tasks that
+        got stuck because the per-link trigger fired before the fix that
+        checks the actual on-disk state.
+        """
+        with SessionLocal() as db:
+            task = db.get(Task, task_id)
+            if not task:
+                return {'ok': False, 'reason': 'task not found'}
+            links = list(task.links)
+        if not links:
+            return {'ok': False, 'reason': 'no links'}
+        # Group links by volume set base
+        by_base: dict[str, list] = {}
+        for l in links:
+            name = l.expected_filename or l.filename
+            if not name or not name.lower().endswith('.rar'):
+                continue
+            base, idx = volume_group_key(name)
+            if idx == 0:
+                continue
+            by_base.setdefault(base, []).append(l)
+        for base, members in by_base.items():
+            # Find any one member whose part file is on disk at the right size
+            for m in members:
+                p = self.part_path(task_id, m)
+                if p is not None:
+                    await self._append_task_log(task_id, f'Manual reprocess: triggering extraction for set {base} via link {m.id}')
+                    await self._set_link_status(m.id, LinkStatus.DOWNLOADING)
+                    await self._try_extract_after_link(task_id, m.id, p)
+                    return {'ok': True, 'triggered_via_link': m.id, 'set': base}
+        return {'ok': False, 'reason': 'no complete sets found on disk'}
+
     async def retry_link(self, link_id: int) -> None:
         task_id = await self.reset_link_state(link_id)
         if task_id is None:
             return
         await self._append_task_log(task_id, f'Retrying link {link_id}')
+        # Resume support: if the part file is already on disk at the expected
+        # size, skip the re-download and go straight to extraction. This is
+        # also how a task that already has every part on disk gets unstuck -
+        # retry any one of its links.
+        with SessionLocal() as db:
+            link = db.get(DownloadLink, link_id)
+            if not link:
+                return
+            existing = self.part_path(task_id, link)
+        if existing is not None:
+            await self._append_task_log(task_id, f'Reusing existing {existing.name} for link {link_id}')
+            await self._update_link_progress(link_id, 1.0, 0.0)
+            with SessionLocal() as db:
+                l2 = db.get(DownloadLink, link_id)
+                l2.filename = existing.name
+                db.commit()
+            await self._set_link_status(link_id, LinkStatus.DOWNLOADING)
+            await self._try_extract_after_link(task_id, link_id, existing)
+            return
         asyncio.create_task(self._process_link(task_id, link_id))
 
     async def _dispatch_loop(self) -> None:
@@ -266,21 +343,26 @@ class Manager:
                         link.expected_filename = filename
                         link.expected_size = total
                         db.commit()
-                received = 0
-                start = time.time()
-                last_update = 0.0
-                with target.open('wb') as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
-                        f.write(chunk)
-                        received += len(chunk)
-                        now = time.time()
-                        if now - last_update > 0.5:
-                            elapsed = now - start
-                            speed = received / elapsed if elapsed > 0 else 0.0
-                            progress = (received / total) if total else 0.0
-                            await self._update_link_progress(link_id, progress, speed)
-                            last_update = now
-                await self._update_link_progress(link_id, 1.0, 0.0)
+                # Resume support: if a file with the expected name and size is
+                # already on disk from a previous run, skip re-downloading.
+                if total and target.exists() and target.stat().st_size == total:
+                    await self._append_task_log(task_id, f'Resumed from existing {target.name} ({total} bytes)')
+                else:
+                    received = 0
+                    start = time.time()
+                    last_update = 0.0
+                    with target.open('wb') as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                            f.write(chunk)
+                            received += len(chunk)
+                            now = time.time()
+                            if now - last_update > 0.5:
+                                elapsed = now - start
+                                speed = received / elapsed if elapsed > 0 else 0.0
+                                progress = (received / total) if total else 0.0
+                                await self._update_link_progress(link_id, progress, speed)
+                                last_update = now
+                    await self._update_link_progress(link_id, 1.0, 0.0)
         with SessionLocal() as db:
             link = db.get(DownloadLink, link_id)
             link.filename = target.name
@@ -339,41 +421,55 @@ class Manager:
             await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
             return
 
-        # Multi-volume set: collect member states.
-        not_terminal = [l for l in members if l.status not in (LinkStatus.DONE, LinkStatus.FAILED)]
-        failed_members = [l for l in members if l.status == LinkStatus.FAILED]
-        if not_terminal:
-            # Wait for the rest to finish. Mark our own status as DOWNLOADING
-            # still so the UI shows progress correctly.
-            return
-        if failed_members:
-            # The set is broken. Mark all members FAILED (other than the
-            # already-failed ones) and clean up any partial files on disk.
-            ids_to_fail = [l.id for l in members if l.status != LinkStatus.FAILED]
-            await self._fail_set_members(task_id, base, ids_to_fail, 'set has failed members')
-            return
-
-        # All members downloaded successfully. Verify every expected part is
-        # on disk with the right size before letting rarfile touch anything.
+        # Multi-volume set. The set's "download phase" is complete when every
+        # member's part file exists on disk at the expected size, OR the link
+        # is FAILED (which means its part file is either missing or short).
+        # We deliberately do NOT use link.status as the trigger because that
+        # field is only set to DONE/FAILED *after* extraction, which would
+        # create a deadlock where extraction can never start.
         settings = get_settings()
         task_dir = Path(settings.temp_path) / f'task_{task_id}'
-        missing = []
+        present: list = []
+        missing: list[str] = []
+        failed_download: list[int] = []
         for m in members:
             part_name = m.expected_filename or m.filename
-            part_idx = volume_group_key(part_name)[1] if part_name else 0
-            # Locate the actual file on disk for this part.
-            candidates = [p for p in task_dir.iterdir() if p.is_file() and volume_group_key(p.name) == (volume_group_key(part_name)[0], part_idx)]
+            base_m, idx_m = volume_group_key(part_name) if part_name else (None, 0)
+            candidates = [p for p in task_dir.iterdir() if p.is_file() and volume_group_key(p.name) == (base_m, idx_m)] if base_m else []
             if not candidates:
-                missing.append(f'{part_name} (not on disk)')
+                if m.status == LinkStatus.FAILED:
+                    failed_download.append(m.id)
+                else:
+                    missing.append(f'{part_name} (not on disk)')
                 continue
             actual = candidates[0]
             if m.expected_size and actual.stat().st_size != m.expected_size:
-                missing.append(f'{actual.name} (size {actual.stat().st_size} != expected {m.expected_size})')
-        if missing:
-            await self._fail_set_members(task_id, base, [l.id for l in members], 'incomplete parts on disk: ' + ', '.join(missing))
-            return
+                if m.status == LinkStatus.FAILED:
+                    failed_download.append(m.id)
+                else:
+                    missing.append(f'{actual.name} (size {actual.stat().st_size} != expected {m.expected_size})')
+                continue
+            present.append(m)
 
-        # Mark this link EXTRACTING (the one that triggered extraction) and run.
+        if missing:
+            await self._append_task_log(
+                task_id,
+                f'Set {base}: waiting for {len(missing)} part(s) - {"; ".join(missing)}',
+            )
+            return
+        if failed_download and not present:
+            await self._fail_set_members(task_id, base, [l.id for l in members], f'set has failed downloads and no parts present')
+            return
+        if failed_download:
+            # Some parts are present, some failed download. We can still try
+            # to extract whatever we have - rarfile will tell us if the set is
+            # truly broken.
+            await self._append_task_log(
+                task_id,
+                f'Set {base}: {len(present)} part(s) present, {len(failed_download)} part(s) failed to download - attempting extract anyway',
+            )
+
+        # All members downloaded successfully. Mark this link EXTRACTING and run.
         await self._set_link_status(link_id, LinkStatus.EXTRACTING)
         try:
             await self._extract_volume_set(task_id, media_type, base, passwords)
@@ -383,7 +479,7 @@ class Manager:
             raise
         # Mark all members DONE (this one already via _set_link_status above).
         for m in members:
-            if m.id != link_id:
+            if m.id != link_id and m.status != LinkStatus.DONE:
                 await self._set_link_status(m.id, LinkStatus.DONE)
                 await bus.publish('links', {'id': m.id, 'task_id': task_id, 'status': 'done'})
         await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
