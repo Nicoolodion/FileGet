@@ -18,17 +18,21 @@ from .events import bus
 from .extractor import (
     configure_rarfile,
     extract_archive,
-    find_main_video,
     find_rar_archive,
+    find_main_video,
     group_rar_volumes,
     list_rar_volumes,
     safe_move,
     safe_rmtree,
+    volume_group_key,
 )
 from .models import DownloadLink, LinkStatus, MediaType, Password, Task, TaskStatus
 from .naming import final_path_for, is_series_type, parse_series_name
+from .notifier import notify_task
 
 log = logging.getLogger(__name__)
+
+VIDEO_SUFFIXES = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.webm'}
 
 
 class Manager:
@@ -38,10 +42,12 @@ class Manager:
         self._configure_semaphore(self._max_concurrent)
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()
-        self._paused.set()  # not paused initially
+        self._paused.set()
         self._worker_task: Optional[asyncio.Task] = None
         self._link_futures: dict[int, asyncio.Future] = {}
         self._futures_lock = asyncio.Lock()
+        self._cancelled_links: set[int] = set()
+        self._cancelled_lock = asyncio.Lock()
 
     def _configure_semaphore(self, n: int) -> None:
         self._sem = asyncio.Semaphore(max(1, n))
@@ -55,7 +61,7 @@ class Manager:
 
     async def stop(self) -> None:
         self._stop.set()
-        self._paused.set()  # release any waiters so the worker exits
+        self._paused.set()
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -68,7 +74,6 @@ class Manager:
         self._configure_semaphore(self._max_concurrent)
 
     def pause(self) -> None:
-        """Pause dispatching new link downloads. In-flight downloads are not cancelled."""
         self._paused.clear()
         bus.publish_sync('manager', {'paused': True})
 
@@ -78,6 +83,44 @@ class Manager:
 
     def is_paused(self) -> bool:
         return not self._paused.is_set()
+
+    async def cancel_link(self, link_id: int) -> None:
+        async with self._cancelled_lock:
+            self._cancelled_links.add(link_id)
+        fut = self._link_futures.get(link_id)
+        if fut and not fut.done():
+            fut.cancel()
+        with SessionLocal() as db:
+            link = db.get(DownloadLink, link_id)
+            if link and link.status not in (LinkStatus.DONE, LinkStatus.FAILED):
+                link.status = LinkStatus.FAILED
+                link.error = 'cancelled'
+                db.commit()
+        await bus.publish('links', {'id': link_id, 'status': 'failed', 'error': 'cancelled'})
+
+    async def reset_link_state(self, link_id: int) -> Optional[int]:
+        """Reset a failed link to PENDING. Returns the link's task_id (or None)."""
+        with SessionLocal() as db:
+            link = db.get(DownloadLink, link_id)
+            if not link:
+                return None
+            task_id = link.task_id
+            link.status = LinkStatus.PENDING
+            link.error = ''
+            link.progress = 0.0
+            link.speed = 0.0
+            link.debrided_url = ''
+            link.filename = ''
+            db.commit()
+        await bus.publish('links', {'id': link_id, 'status': 'pending', 'error': '', 'progress': 0, 'speed': 0})
+        return task_id
+
+    async def retry_link(self, link_id: int) -> None:
+        task_id = await self.reset_link_state(link_id)
+        if task_id is None:
+            return
+        await self._append_task_log(task_id, f'Retrying link {link_id}')
+        asyncio.create_task(self._process_link(task_id, link_id))
 
     async def _dispatch_loop(self) -> None:
         while not self._stop.is_set():
@@ -101,24 +144,32 @@ class Manager:
                 asyncio.create_task(self._process_task(task_id))
             except asyncio.CancelledError:
                 break
-            except Exception as e:  # pragma: no cover - dispatch loop
+            except Exception as e:  # pragma: no cover
                 log.exception('dispatch loop error: %s', e)
                 await asyncio.sleep(2)
 
     async def _process_task(self, task_id: int) -> None:
+        """Fan out per-link workers, then wait for all of them to finish.
+
+        Each worker is responsible for downloading a single link and signalling
+        when it has finished so that per-volume-set extraction can be triggered.
+        The task itself is finalized after every link has reached a terminal
+        state (DONE/FAILED)."""
         try:
             with SessionLocal() as db:
                 task = db.get(Task, task_id)
                 if not task:
                     return
                 link_ids = [l.id for l in task.links]
+            if not link_ids:
+                await self._finalize_task(task_id)
+                return
             futures = []
             for lid in link_ids:
                 fut = asyncio.create_task(self._process_link(task_id, lid))
                 self._link_futures[lid] = fut
                 futures.append(fut)
-            if futures:
-                await asyncio.gather(*futures, return_exceptions=True)
+            await asyncio.gather(*futures, return_exceptions=True)
             await self._finalize_task(task_id)
         except Exception as e:
             log.exception('_process_task error: %s', e)
@@ -126,12 +177,22 @@ class Manager:
 
     async def _process_link(self, task_id: int, link_id: int) -> None:
         async with self._sem:
+            if await self._is_cancelled(link_id):
+                return
             try:
                 debrided = await self._debrid_link(task_id, link_id)
                 if not debrided:
                     return
-                await self._download_link(task_id, link_id, debrided)
-                await self._set_link_status(link_id, LinkStatus.EXTRACTING)
+                if await self._is_cancelled(link_id):
+                    return
+                path = await self._download_link(task_id, link_id, debrided)
+                if await self._is_cancelled(link_id):
+                    return
+                await self._try_extract_after_link(task_id, link_id, path)
+            except asyncio.CancelledError:
+                async with self._cancelled_lock:
+                    self._cancelled_links.discard(link_id)
+                await self._append_task_log(task_id, f'Link {link_id} cancelled')
             except Exception as e:
                 log.exception('link %s failed: %s', link_id, e)
                 await self._set_link_status(link_id, LinkStatus.FAILED, error=str(e))
@@ -140,12 +201,20 @@ class Manager:
                 async with self._futures_lock:
                     self._link_futures.pop(link_id, None)
 
+    async def _is_cancelled(self, link_id: int) -> bool:
+        async with self._cancelled_lock:
+            return link_id in self._cancelled_links
+
     async def _debrid_link(self, task_id: int, link_id: int) -> Optional[str]:
         with SessionLocal() as db:
             link = db.get(DownloadLink, link_id)
             if not link:
                 return None
             original = link.original_url
+            existing = link.debrided_url
+        if existing:
+            await self._set_link_status(link_id, LinkStatus.DOWNLOADING)
+            return existing
         await self._set_link_status(link_id, LinkStatus.DEBRIDDING)
         await self._append_task_log(task_id, f'Debriding: {original}')
         client = get_client()
@@ -210,61 +279,93 @@ class Manager:
         await self._append_task_log(task_id, f'Download finished: {target.name}')
         return target
 
-    async def _finalize_task(self, task_id: int) -> None:
-        """After all links are downloaded, group multi-volume RARs and extract each set."""
+    async def _try_extract_after_link(self, task_id: int, link_id: int, downloaded: Path) -> None:
+        """Inspect the link's file; if it is part of a multi-volume set, try to extract
+        that set as soon as all its siblings have also finished downloading."""
         with SessionLocal() as db:
-            task = db.get(Task, task_id)
-            if not task:
+            link = db.get(DownloadLink, link_id)
+            if not link:
                 return
+            task = db.get(Task, task_id)
             links = list(task.links)
-        any_failed = any(l.status == LinkStatus.FAILED for l in links)
-        all_done = all(l.status in (LinkStatus.DONE, LinkStatus.FAILED) for l in links)
-        if not all_done:
-            return
-        if any_failed and not all(l.status == LinkStatus.DONE for l in links):
-            await self._set_task_status(task_id, TaskStatus.FAILED, 'One or more links failed')
-            await self._cleanup_task_dir(task_id)
-            return
-
-        settings = get_settings()
-        temp_root = Path(settings.temp_path)
-        task_dir = temp_root / f'task_{task_id}'
-        extract_root = task_dir / 'extracted'
-        extract_root.mkdir(parents=True, exist_ok=True)
-
-        rar_files = list_rar_volumes(task_dir)
-        with SessionLocal() as db:
             passwords = [p.value for p in db.query(Password).order_by(Password.position.asc(), Password.id.asc()).all()]
-        if rar_files:
-            groups = group_rar_volumes(rar_files)
-            await self._append_task_log(task_id, f'Found {len(groups)} archive set(s) to extract')
-            for group in groups:
-                first = group[0]
-                # Extract the whole set at once; rarfile walks .part1..partN
-                extract_dest = extract_root / first.stem
-                extract_dest.mkdir(parents=True, exist_ok=True)
-                note = f'Extracting {first.name}' + (f' (+{len(group)-1} part)' if len(group) > 1 else '') + f' (passwords: {len(passwords)})'
-                await self._append_task_log(task_id, note)
-                try:
-                    extracted_video = extract_archive(first, extract_dest, passwords, first_volume=first)
-                except Exception as e:
-                    raise RuntimeError(f'Extraction failed for {first.name} (all passwords tried): {e}') from e
-                if not extracted_video or not extracted_video.exists():
-                    raise RuntimeError(f'Could not locate a video file after extracting {first.name}')
-                await self._move_video(task_id, first.name, extracted_video)
-        else:
-            # No archives - move any video files at the task root directly
-            for f in task_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.webm'}:
-                    await self._move_video(task_id, f.name, f)
+            media_type: MediaType = task.media_type
 
-        with SessionLocal() as db:
-            for link in links:
-                link.status = LinkStatus.DONE
-                db.add(link)
-            db.commit()
-        await self._set_task_status(task_id, TaskStatus.COMPLETED)
-        await self._cleanup_task_dir(task_id)
+        filename = downloaded.name
+        suffix = downloaded.suffix.lower()
+        if suffix == '.rar':
+            base, idx = volume_group_key(filename)
+            if idx > 0:
+                # Multi-volume set: wait for every other link in this task that
+                # also belongs to the same set to reach a terminal state.
+                siblings = [l for l in links if l.id != link_id and l.filename and volume_group_key(l.filename)[0] == base]
+                in_flight = [l for l in siblings if l.status not in (LinkStatus.DONE, LinkStatus.FAILED)]
+                failed = [l for l in siblings if l.status == LinkStatus.FAILED]
+                if in_flight:
+                    return
+                if failed:
+                    # Don't try to extract a broken set; the task finalize step
+                    # will mark it FAILED.
+                    return
+                # All siblings done. Group the files we have on disk and extract.
+                await self._set_link_status(link_id, LinkStatus.EXTRACTING)
+                try:
+                    await self._extract_volume_set(task_id, media_type, base, passwords)
+                except Exception as e:
+                    await self._append_task_log(task_id, f'Set {base} extraction failed: {e}')
+                    raise
+                await self._set_link_status(link_id, LinkStatus.DONE)
+                await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+                return
+
+        # Single-volume RAR or non-archive file: extract/move immediately.
+        await self._set_link_status(link_id, LinkStatus.EXTRACTING)
+        try:
+            await self._extract_or_move_one(task_id, media_type, downloaded, passwords)
+        except Exception as e:
+            await self._append_task_log(task_id, f'Link {link_id} extraction failed: {e}')
+            raise
+        await self._set_link_status(link_id, LinkStatus.DONE)
+        await bus.publish('links', {'id': link_id, 'task_id': task_id, 'status': 'done'})
+
+    async def _extract_volume_set(self, task_id: int, media_type: MediaType, base: str, passwords: list[str]) -> None:
+        settings = get_settings()
+        task_dir = Path(settings.temp_path) / f'task_{task_id}'
+        files = [p for p in task_dir.iterdir() if p.is_file() and volume_group_key(p.name)[0] == base]
+        if not files:
+            raise RuntimeError(f'No files found on disk for set {base}')
+        files.sort(key=lambda p: volume_group_key(p.name)[1] or 0)
+        first = files[0]
+        extract_dest = task_dir / 'extracted' / first.stem
+        extract_dest.mkdir(parents=True, exist_ok=True)
+        note = f'Extracting {first.name}' + (f' (+{len(files) - 1} parts)' if len(files) > 1 else '') + f' (passwords: {len(passwords)})'
+        await self._append_task_log(task_id, note)
+        extracted_video = extract_archive(first, extract_dest, passwords, first_volume=first)
+        await self._move_video(task_id, first.name, extracted_video)
+        # Clean up the source parts now that they're on the media drive.
+        for f in files:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    async def _extract_or_move_one(self, task_id: int, media_type: MediaType, file: Path, passwords: list[str]) -> None:
+        if file.suffix.lower() == '.rar':
+            settings = get_settings()
+            task_dir = Path(settings.temp_path) / f'task_{task_id}'
+            extract_dest = task_dir / 'extracted' / file.stem
+            extract_dest.mkdir(parents=True, exist_ok=True)
+            await self._append_task_log(task_id, f'Extracting {file.name} (passwords: {len(passwords)})')
+            video = extract_archive(file, extract_dest, passwords, first_volume=file)
+            await self._move_video(task_id, file.name, video)
+        elif file.suffix.lower() in VIDEO_SUFFIXES:
+            await self._move_video(task_id, file.name, file)
+        else:
+            await self._append_task_log(task_id, f'Link file {file.name} is not a recognized media archive; leaving in place at {file}')
+        try:
+            file.unlink()
+        except OSError:
+            pass
 
     async def _move_video(self, task_id: int, source_filename: str, video_path: Path) -> None:
         with SessionLocal() as db:
@@ -276,6 +377,32 @@ class Manager:
         final.parent.mkdir(parents=True, exist_ok=True)
         safe_move(video_path, final)
         await self._append_task_log(task_id, f'Done: {final}')
+
+    async def _finalize_task(self, task_id: int) -> None:
+        with SessionLocal() as db:
+            task = db.get(Task, task_id)
+            if not task:
+                return
+            links = list(task.links)
+        if not links:
+            await self._set_task_status(task_id, TaskStatus.COMPLETED)
+            await notify_task(task_id, 'completed', 'Empty task')
+            await self._cleanup_task_dir(task_id)
+            return
+        all_terminal = all(l.status in (LinkStatus.DONE, LinkStatus.FAILED) for l in links)
+        if not all_terminal:
+            return
+        any_failed = any(l.status == LinkStatus.FAILED for l in links)
+        all_done = all(l.status == LinkStatus.DONE for l in links)
+        if any_failed and not all_done:
+            await self._set_task_status(task_id, TaskStatus.FAILED, 'One or more links failed')
+            await notify_task(task_id, 'failed', 'One or more links failed')
+        elif all_done:
+            await self._set_task_status(task_id, TaskStatus.COMPLETED)
+            await notify_task(task_id, 'completed', f'All {len(links)} links done')
+        else:
+            await self._set_task_status(task_id, TaskStatus.COMPLETED)
+        await self._cleanup_task_dir(task_id)
 
     async def _cleanup_task_dir(self, task_id: int) -> None:
         settings = get_settings()
@@ -354,8 +481,7 @@ def _sanitize_filename(name: str) -> str:
 
 def _free_bytes(path: Path) -> Optional[int]:
     try:
-        import shutil as _sh
-        return _sh.disk_usage(str(path)).free
+        return shutil.disk_usage(str(path)).free
     except Exception:
         return None
 

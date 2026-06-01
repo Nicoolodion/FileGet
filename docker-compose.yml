@@ -9,13 +9,15 @@ services:
     environment:
       - PUID=${PUID:-99}
       - PGID=${PGID:-100}
+    # The HOST_*_PATH variables below are bind-mounted into the container.
+    # Edit those values in .env (or override here). The container paths
     volumes:
       - ./data:/app/data
-      - ${MEDIA_PATH_MOVIES:-/mnt/media/Movies}:/media/Movies
-      - ${MEDIA_PATH_SERIES:-/mnt/media/Series}:/media/Series
-      - ${MEDIA_PATH_ANIME_MOVIES:-/mnt/media/Anime-Movies}:/media/Anime-Movies
-      - ${MEDIA_PATH_ANIME_SERIES:-/mnt/media/Anime-Series}:/media/Anime-Series
-      - ${MEDIA_PATH_UNCATEGORIZED:-/mnt/media/Uncategorized}:/media/Uncategorized
-      - ${TEMP_PATH:-/mnt/cache/plex-get-temp}:/temp
+      - ${HOST_MEDIA_PATH_MOVIES}:/media/Movies
+      - ${HOST_MEDIA_PATH_SERIES}:/media/Series
+      - ${HOST_MEDIA_PATH_ANIME_MOVIES}:/media/Anime-Movies
+      - ${HOST_MEDIA_PATH_ANIME_SERIES}:/media/Anime-Series
+      - ${HOST_MEDIA_PATH_UNCATEGORIZED}:/media/Uncategorized
+      - ${HOST_TEMP_PATH}:/temp
     ports:
       - "${WEB_PORT:-8000}:8000"

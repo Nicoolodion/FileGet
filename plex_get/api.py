@@ -222,6 +222,26 @@ async def delete_task(task_id: int, request: Request, db: Session = Depends(get_
     return {"ok": True}
 
 
+@app.post("/api/links/{link_id}/cancel")
+async def cancel_link(link_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_auth(request)
+    link = db.get(DownloadLink, link_id)
+    if not link:
+        raise HTTPException(404, "Link not found")
+    await get_manager().cancel_link(link_id)
+    return {"ok": True}
+
+
+@app.post("/api/links/{link_id}/retry")
+async def retry_link(link_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_auth(request)
+    link = db.get(DownloadLink, link_id)
+    if not link:
+        raise HTTPException(404, "Link not found")
+    await get_manager().retry_link(link_id)
+    return {"ok": True}
+
+
 @app.get("/api/passwords")
 async def list_passwords(request: Request, db: Session = Depends(get_db)):
     _require_auth(request)
@@ -271,6 +291,9 @@ async def reorder_passwords(request: Request, order: list[int], db: Session = De
 async def list_settings(request: Request, db: Session = Depends(get_db)):
     _require_auth(request)
     s = get_settings()
+    from .notifier import disk_usage_summary
+    from .models import Setting as _Setting
+    row = db.get(_Setting, 'discord_webhook_url')
     return {
         "max_concurrent_downloads": s.max_concurrent_downloads,
         "media_paths": {
@@ -282,6 +305,8 @@ async def list_settings(request: Request, db: Session = Depends(get_db)):
         },
         "temp_path": s.temp_path,
         "media_types": [m.value for m in MediaType],
+        "discord_webhook_url": (row.value if row else '') or '',
+        "disk": disk_usage_summary(),
     }
 
 
@@ -311,6 +336,21 @@ async def manager_status(request: Request):
     _require_auth(request)
     m = get_manager()
     return {"paused": m.is_paused()}
+
+
+@app.post("/api/settings/discord")
+async def set_discord_webhook(payload: dict, request: Request, db: Session = Depends(get_db)):
+    _require_auth(request)
+    from .models import Setting as _Setting
+    url = (payload.get('url') or '').strip()
+    row = db.get(_Setting, 'discord_webhook_url')
+    if not row:
+        row = _Setting(key='discord_webhook_url', value=url)
+        db.add(row)
+    else:
+        row.value = url
+    db.commit()
+    return {"ok": True, "url": url}
 
 
 @app.websocket("/ws")
