@@ -12,16 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install the official RARLAB unrar binary. The Debian repos don't ship
 # the proprietary unrar (only unar / unrar-free which is unreliable for
-# encrypted RAR5 volumes). We download a static build into /usr/local/bin
-# so it's picked up by the `unrar` lookup in plex_get.extractor.
-ARG UNRAR_VERSION=7.1.7
+# encrypted RAR5 volumes). The Linux archive is named rarlinux-x64-XXX.tar.gz
+# and contains both `rar` and `unrar` binaries; we install only `unrar`.
+ARG RAR_VERSION=722
 RUN set -eux; \
     cd /tmp; \
-    curl -fsSL -o unrar.tar.gz \
-        "https://www.rarlab.com/rar/unrarlinux-x64-${UNRAR_VERSION}.tar.gz"; \
-    tar -xzf unrar.tar.gz; \
-    install -m 0755 unrar /usr/local/bin/unrar; \
-    rm -rf unrar.tar.gz unrar rarfiles.txt /tmp/*; \
+    curl -fsSL -o rarlinux.tar.gz \
+        "https://www.rarlab.com/rar/rarlinux-x64-${RAR_VERSION}.tar.gz"; \
+    tar -xzf rarlinux.tar.gz; \
+    install -m 0755 rar/unrar /usr/local/bin/unrar; \
+    rm -rf rarlinux.tar.gz rar /tmp/*; \
     unrar 2>&1 | head -1 || true
 
 WORKDIR /app
