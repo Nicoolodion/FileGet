@@ -27,7 +27,7 @@ from .extractor import (
     volume_group_key,
 )
 from .models import DownloadLink, LinkStatus, MediaType, Password, Task, TaskStatus
-from .naming import final_path_for, is_series_type, parse_series_name
+from .naming import final_path_for, is_series_type, parse_movie_name, parse_series_name
 from .notifier import notify_task
 
 log = logging.getLogger(__name__)
@@ -522,13 +522,17 @@ class Manager:
         note = f'Extracting {first.name}' + (f' (+{len(files) - 1} parts)' if len(files) > 1 else '') + f' (passwords: {len(passwords)})'
         await self._append_task_log(task_id, note)
         extracted_video = extract_archive(first, extract_dest, passwords, first_volume=first)
-        await self._move_video(task_id, first.name, extracted_video)
-        # Clean up the source parts now that they're on the media drive.
+        # Use the extracted VIDEO's filename (not the archive's GUID) for the
+        # show/movie/season parser - this is what Plex will actually see.
+        await self._move_video(task_id, extracted_video.name, extracted_video)
+        # Clean up the source RAR parts AND the entire extract dir (txt files,
+        # sample/preview clips, subtitles, anything else the archive contained).
         for f in files:
             try:
                 f.unlink()
             except OSError:
                 pass
+        safe_rmtree(extract_dest)
 
     async def _extract_or_move_one(self, task_id: int, media_type: MediaType, file: Path, passwords: list[str]) -> None:
         if file.suffix.lower() == '.rar':
@@ -538,7 +542,8 @@ class Manager:
             extract_dest.mkdir(parents=True, exist_ok=True)
             await self._append_task_log(task_id, f'Extracting {file.name} (passwords: {len(passwords)})')
             video = extract_archive(file, extract_dest, passwords, first_volume=file)
-            await self._move_video(task_id, file.name, video)
+            await self._move_video(task_id, video.name, video)
+            safe_rmtree(extract_dest)
         elif file.suffix.lower() in VIDEO_SUFFIXES:
             await self._move_video(task_id, file.name, file)
         else:
@@ -552,7 +557,15 @@ class Manager:
         with SessionLocal() as db:
             task = db.get(Task, task_id)
             media_type: MediaType = task.media_type
-            parsed = parse_series_name(source_filename)
+            if is_series_type(media_type):
+                parsed = parse_series_name(source_filename)
+            else:
+                # parse_movie_name returns (title, year). Wrap into a ParsedName
+                # so final_path_for works uniformly. Use the raw filename as the
+                # `raw` field so the folder builder sees the full original name.
+                from .naming import ParsedName, movie_folder
+                title, year = parse_movie_name(source_filename)
+                parsed = ParsedName(show=title, season=None, episode=None, is_special=False, raw=source_filename)
             final = final_path_for(media_type, parsed, video_path.name)
         await self._append_task_log(task_id, f'Moving to {final}')
         final.parent.mkdir(parents=True, exist_ok=True)
