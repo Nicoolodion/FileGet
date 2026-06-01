@@ -102,34 +102,94 @@ def extract_archive(
     `.part1.rar` of a set), rarfile uses it as the entry-point and automatically follows
     the subsequent `.partN.rar` siblings on disk.
 
-    Passwords are tried only for `PasswordRequired`-style errors. A `BadRarFile`
-    (truncated file, bad CRC, missing volume) is treated as corruption and raised
-    immediately as `ArchiveCorrupt` - trying more passwords won't help.
+    Passwords are tried in order. Each attempt's output is verified: if the
+    largest extracted file is suspiciously small (less than 1% of the
+    archive's claimed file size), we treat it as a wrong-password / bad
+    extraction and try the next password. Some backends (notably unar with
+    RAR5 + wrong password) silently produce 0-byte output instead of raising.
     """
     destination.mkdir(parents=True, exist_ok=True)
     entry = first_volume or archive
     last_error: Optional[Exception] = None
+    # Determine the expected extracted file size from the archive header so we
+    # can detect 'silent zero-byte output' failures.
+    expected_size = _archive_uncompressed_size(entry)
+    log.info('Extracting %s (entry=%s, expected_uncompressed=%s, backend=%s)', archive, entry, expected_size, rarfile.UNRAR_TOOL)
     for pw in [''] + passwords:
         try:
             with rarfile.RarFile(str(entry)) as rf:
                 if pw:
                     rf.setpassword(pw)
                 rf.extractall(str(destination))
-            return _largest_video_in_dir(destination) or _resolve_extracted_video(destination)
+            # Verify: the largest extracted file should be > 1% of the
+            # archive's claimed uncompressed size. If we get a tiny / 0-byte
+            # file, the password is almost certainly wrong - keep trying.
+            largest = _largest_video_in_dir(destination)
+            if largest is None:
+                largest = _any_file_in_dir(destination)
+            if largest is None or largest.stat().st_size == 0:
+                log.warning('Password %r produced no output - trying next', pw)
+                _clear_destination(destination)
+                continue
+            if expected_size and largest.stat().st_size < expected_size * 0.01:
+                log.warning('Password %r produced %d bytes (expected ~%d) - trying next', pw, largest.stat().st_size, expected_size)
+                _clear_destination(destination)
+                continue
+            return largest
         except rarfile.PasswordRequired as e:
             last_error = e
             log.debug('Rar extract needs password (pw=%r): %s', pw, e)
+            _clear_destination(destination)
             continue
         except (rarfile.BadRarFile, Exception) as e:
-            # BadRarFile here means a real problem with the archive content
-            # (truncated read, bad CRC, missing volume, ...). Trying more
-            # passwords is pointless; surface as ArchiveCorrupt so the caller
-            # can re-download / fail cleanly.
+            last_error = e
             log.debug('Rar extract failed (pw=%r): %s', pw, e)
-            raise ArchiveCorrupt(str(e)) from e
+            _clear_destination(destination)
+            continue
     if last_error:
         raise last_error
     raise RuntimeError('Extraction failed for unknown reason')
+
+
+def _any_file_in_dir(directory: Path) -> Optional[Path]:
+    try:
+        files = [p for p in directory.rglob('*') if p.is_file()]
+    except Exception:
+        return None
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def _clear_destination(directory: Path) -> None:
+    import shutil as _sh
+    try:
+        for p in directory.iterdir():
+            if p.is_file() or p.is_symlink():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            elif p.is_dir():
+                try:
+                    _sh.rmtree(p)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _archive_uncompressed_size(archive: Path) -> int:
+    """Return the total uncompressed size declared in the archive header (0 if unknown)."""
+    try:
+        with rarfile.RarFile(str(archive)) as rf:
+            total = 0
+            for info in rf.infolist():
+                if not info.is_dir():
+                    total += getattr(info, 'file_size', 0) or 0
+            return total
+    except Exception:
+        return 0
 
 
 def _resolve_extracted_video(directory: Path) -> Path:
@@ -186,6 +246,10 @@ def safe_move(src: Path, dst: Path) -> None:
 def configure_rarfile() -> None:
     import os
     import shutil
+    # Prefer the real unrar over unar: unar is known to silently produce
+    # 0-byte output for some RAR5 encrypted volumes when the password is
+    # slightly off, while unrar raises a clear error. unrar is downloaded
+    # at build time via /usr/local/bin/unrar (see Dockerfile).
     if shutil.which('unrar'):
         rarfile.UNRAR_TOOL = 'unrar'
     elif shutil.which('unar'):
